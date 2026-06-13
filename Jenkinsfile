@@ -1,13 +1,15 @@
-// Jenkins pipeline: build the Docker image with Kaniko (no Docker daemon needed)
-// and push it to the in-cluster registry at 192.168.1.245:5001.
+// Full CI/CD pipeline for hello-world:
+//   1. Build the image with Kaniko (no Docker daemon) and push to the in-cluster
+//      registry, tagged with both the unique build number and :latest.
+//   2. Update the deployment manifest in the infra repo to point at this build's
+//      unique tag, and push that change. ArgoCD sees the manifest change and
+//      auto-deploys the new image.
 //
-// Kaniko runs as a container inside an ephemeral Kubernetes pod that the Jenkins
-// Kubernetes plugin spins up for this build, then throws away when done.
+// The build pod has two containers: `kaniko` (builds) and `git` (writes back).
 
 pipeline {
   agent {
     kubernetes {
-      // Define the build pod: one kaniko container that stays alive while we work.
       yaml '''
 apiVersion: v1
 kind: Pod
@@ -18,13 +20,20 @@ spec:
       command: ["sleep"]
       args: ["infinity"]
       tty: true
+    - name: git
+      image: alpine/git:2.45.2
+      command: ["sleep"]
+      args: ["infinity"]
+      tty: true
 '''
     }
   }
 
   environment {
-    REGISTRY = "192.168.1.245:5001"
-    IMAGE    = "hello-world"
+    REGISTRY   = "192.168.1.245:5001"
+    IMAGE      = "hello-world"
+    INFRA_REPO = "github.com/AmanHogan/k3s-data-platform.git"
+    MANIFEST   = "manifests/hello-world/deployment.yaml"
   }
 
   stages {
@@ -37,9 +46,34 @@ spec:
               --dockerfile Dockerfile \
               --destination ${REGISTRY}/${IMAGE}:${BUILD_NUMBER} \
               --destination ${REGISTRY}/${IMAGE}:latest \
-              --insecure \
-              --skip-tls-verify
+              --insecure --skip-tls-verify
           '''
+        }
+      }
+    }
+
+    stage('Update manifest & push (GitOps)') {
+      steps {
+        container('git') {
+          withCredentials([usernamePassword(credentialsId: 'github-pat',
+                                             usernameVariable: 'GIT_USER',
+                                             passwordVariable: 'GIT_TOKEN')]) {
+            sh '''
+              git config --global user.email "jenkins@k3s.local"
+              git config --global user.name "jenkins-ci"
+
+              rm -rf infra
+              git clone "https://${GIT_USER}:${GIT_TOKEN}@${INFRA_REPO}" infra
+              cd infra
+
+              # Point the deployment at this build's unique image tag.
+              sed -i "s#image: .*/${IMAGE}:.*#image: ${REGISTRY}/${IMAGE}:${BUILD_NUMBER}#" ${MANIFEST}
+
+              git add ${MANIFEST}
+              git commit -m "Deploy ${IMAGE}:${BUILD_NUMBER}" || { echo "No manifest change"; exit 0; }
+              git push origin master
+            '''
+          }
         }
       }
     }
@@ -47,7 +81,7 @@ spec:
 
   post {
     success {
-      echo "Pushed ${REGISTRY}/${IMAGE}:${BUILD_NUMBER} and :latest"
+      echo "Built ${REGISTRY}/${IMAGE}:${BUILD_NUMBER} and updated the manifest. ArgoCD will deploy it."
     }
   }
 }
